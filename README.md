@@ -24,7 +24,10 @@ the game's own address is used, exactly as without the mod.
 the known world servers in the background. Nothing but the login itself talks to the servers
 while the game authenticates.
 A test waits for the world server's real greeting (`SMSG_AUTH_CHALLENGE`), not just a TCP
-handshake. When the realm list arrives, each realm's address is replaced with the best server:
+handshake. The known world servers are the ones `normal`, `hc` and `pvp.octowow.st` resolve to, a
+built-in list of servers OctoWoW has used that are not in DNS, and every address OctoWoW offers
+in a realm list (remembered for later logins). When the realm list arrives, each realm's
+address is replaced with the best server:
 fewest failed tests first, then the lowest median ping. OctoWoW's own pick is kept if it lost
 nothing and is at most 20 ms slower than the best. The world addresses OctoWoW offers are
 remembered, so servers that are not in DNS are tested on the next login.
@@ -38,8 +41,8 @@ OctoWoW's DDoS protection punishes bursts of new connections from one IP. OctoLo
 connects while you log in, never during play:
 
 - login: one attempt per address, at most 8 addresses;
-- world: only after the login succeeded, at most 3 new connections per second for all servers
-  together, spread over the window;
+- world: only after the login succeeded, at most 2 tests per server and at most 3 new
+  connections per second for all servers together, spread over the window;
 - a second login within 3 minutes reuses the results instead of testing again.
 
 ## Safety
@@ -119,8 +122,17 @@ server selection outside the game. OctoLogin replaces it; if you still run octop
 
 ## Changes
 
-**1.0.1**: world servers are tested only after the login succeeded (when the game asks for the
-realm list), not while the game authenticates.
+**1.0.2**
+- World tests no longer wait for each other: a slow server (or a slow VPN) cannot use up the
+  window, and a test waits up to 3 seconds for the greeting. At most 2 tests per server.
+- A built-in list of world servers OctoWoW has offered that are not in DNS. One of them kept
+  N'Zoth reachable when the servers OctoWoW offered at the time did not answer.
+- More than 8 remembered world addresses are used (earlier ones past the 8th were dropped).
+- The realm list is handed over as soon as all tests have finished, not only at the end of the
+  window.
+
+**1.0.1** (pre-release): world servers are tested only after the login succeeded (when the game
+asks for the realm list), not while the game authenticates.
 
 **1.0.0**: first release.
 

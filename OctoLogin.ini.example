@@ -15,7 +15,11 @@ skiploopback=1
 world=1
 ; world servers resolved on every login (host:port; the port decides the realm)
 world_hosts=normal.octowow.st:8091,hc.octowow.st:8090,pvp.octowow.st:8092
+; world servers OctoWoW has offered in realm lists that are not in DNS (built in; worlds= adds the ones seen later)
+known_worlds=92.114.107.53:8091,92.114.107.56:8091,92.114.107.61:8091,92.114.107.62:8091,92.114.107.47:8090,92.114.107.57:8090,92.114.107.49:8092,92.114.107.55:8092
 ; probe window, minimum time between two new probe connections, probe timeout (ms)
 world_window_ms=8000
 world_rate_ms=334
-world_timeout_ms=1500
+world_timeout_ms=3000
+; probes per world server (each login)
+world_rounds=2

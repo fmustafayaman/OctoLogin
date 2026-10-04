@@ -105,6 +105,9 @@ int main(int argc, char **argv)
 		snprintf(ex, sizeof ex, "127.0.0.1:3724,127.0.0.1:%d", LSRV);
 		snprintf(wh, sizeof wh, "127.0.0.1:%d,127.0.0.1:%d,127.0.0.1:%d,127.0.0.1:%d", WFAST, WSLOW, WDEAD, WNEAR);
 		ini("extra", ex); ini("skiploopback", "0"); ini("enabled", "1"); ini("lastgood", "");
+		/* the built-in list holds real OctoWoW servers: tests must never reach them. Instead 9 local
+		 * addresses that refuse at once, to check that more than 8 entries are all used. */
+		ini("known_worlds", "127.0.0.2:1,127.0.0.2:2,127.0.0.2:3,127.0.0.2:4,127.0.0.2:5,127.0.0.2:6,127.0.0.2:7,127.0.0.2:8,127.0.0.2:9");
 		ini("world", "1"); ini("test_any_port", "1"); ini("world_hosts", wh); ini("worlds", ""); ini("world_window_ms", "1500"); ini("world_rate_ms", "100"); ini("world_timeout_ms", "500");
 		SOCKET s = socket(AF_INET, SOCK_STREAM, 0);
 		struct sockaddr_in a = {0}; a.sin_family = AF_INET; a.sin_port = htons(3724); a.sin_addr.s_addr = inet_addr("127.0.0.1");
@@ -132,8 +135,12 @@ int main(int argc, char **argv)
 		}
 		DWORD took = GetTickCount() - t0;
 		CHECK(want > 0 && glen == want, "realm list received in full");
-		CHECK(took >= 1300 && took < 3500, "held until probing finished, then delivered");
+		/* the dead server's tests end by their 500 ms timeout; the window is 1500 ms */
+		CHECK(took >= 500 && took < 1500 + 800, "held until every test finished (not longer than the window), then delivered");
 		CHECK(world_connections() > 0, "world servers are tested once the client asks for the realm list");
+		{ char log[8192] = ""; FILE *f = fopen("OctoLogin.log", "r"); if (f) { size_t k = fread(log, 1, sizeof log - 1, f); log[k] = 0; fclose(f); }
+		  CHECK(strstr(log, "testing 13 known world servers") != NULL, "every listed world server is used (4 from DNS + 9 known, no 8-entry limit)");
+		  CHECK(strstr(log, "92.114.107") == NULL, "no real OctoWoW server was contacted by the tests"); }
 		CHECK(maxsel <= 300, "select did not freeze the game while holding");
 		/* decode the realm address fields */
 		char addr[3][64] = {"", "", ""}; int i = 3 + 4 + 1;

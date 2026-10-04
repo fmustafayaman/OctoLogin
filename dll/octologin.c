@@ -18,7 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define OL_VERSION "1.0.1"
+#define OL_VERSION "1.0.2"
 #define ADDR_IAT_CONNECT 0x007FF6D0u /* WoW.exe: WSOCK32 #4 (connect) */
 #define LOGIN_PORT 3724
 #define MAX_CAND 8
@@ -343,49 +343,76 @@ static DWORD median(DWORD *v, int n)
 	return n ? v[n / 2] : 0;
 }
 
-static int g_rateMs = 334, g_windowMs = 8000, g_timeoutMs = 1500;
+static int g_rateMs = 334, g_windowMs = 8000, g_timeoutMs = 3000, g_rounds = 2;
 static int g_anyPort; /* tests only: treat candidates on any port as the same realm */
 
 static void collect_worlds(void);
+
+typedef struct {
+	int i;
+	struct sockaddr_in a;
+} ProbeArg;
+static volatile LONG g_inflight; /* probes started and not finished yet */
+
+/* One probe on its own short thread, so a slow server does not hold up the others. */
+static DWORD WINAPI one_probe(LPVOID p)
+{
+	ProbeArg *pa = p;
+	DWORD ms = probe_world(&pa->a, (DWORD)g_timeoutMs);
+	EnterCriticalSection(&g_wlock);
+	World *w = &g_world[pa->i];
+	if (ms && w->ok < MAX_PROBES)
+		w->ms[w->ok++] = ms;
+	w->total++;
+	LeaveCriticalSection(&g_wlock);
+	free(pa);
+	InterlockedDecrement(&g_inflight);
+	return 0;
+}
 
 static DWORD WINAPI probe_thread(LPVOID unused)
 {
 	(void)unused;
 	collect_worlds(); /* DNS lookups happen here, not on the game's thread */
 	DWORD t0 = GetTickCount();
+	g_probeEnd = t0 + (DWORD)g_windowMs; /* the realm list is held for the whole window, DNS time not counted */
+	/* new connections at most every g_rateMs; the last one starts early enough to finish in the window */
+	DWORD last_start = g_windowMs > g_timeoutMs ? (DWORD)(g_windowMs - g_timeoutMs) : 0;
 	DWORD next = t0;
-	for (int round = 0;; round++) {
+	for (int round = 0; round < g_rounds; round++) {
 		EnterCriticalSection(&g_wlock);
 		int n = g_nworld;
 		LeaveCriticalSection(&g_wlock);
-		int did = 0;
 		for (int i = 0; i < n; i++) {
-			EnterCriticalSection(&g_wlock);
-			int need = g_world[i].total <= round && g_world[i].total < MAX_PROBES;
-			struct sockaddr_in a = g_world[i].a;
-			LeaveCriticalSection(&g_wlock);
-			if (!need)
-				continue;
-			if (GetTickCount() - t0 >= (DWORD)g_windowMs)
-				goto done;
 			DWORD now = GetTickCount();
-			if ((LONG)(next - now) > 0)
+			if ((LONG)(next - now) > 0) {
 				Sleep(next - now);
-			next = GetTickCount() + (DWORD)g_rateMs;
-			DWORD ms = probe_world(&a, (DWORD)g_timeoutMs);
+				now = GetTickCount();
+			}
+			if (now - t0 > last_start)
+				goto wait;
+			next = now + (DWORD)g_rateMs;
+			ProbeArg *pa = malloc(sizeof *pa);
+			if (!pa)
+				continue;
 			EnterCriticalSection(&g_wlock);
-			if (ms)
-				g_world[i].ms[g_world[i].ok++] = ms;
-			g_world[i].total++;
+			pa->i = i;
+			pa->a = g_world[i].a;
 			LeaveCriticalSection(&g_wlock);
-			did = 1;
+			InterlockedIncrement(&g_inflight);
+			HANDLE th = CreateThread(NULL, 0, one_probe, pa, 0, NULL);
+			if (th)
+				CloseHandle(th);
+			else {
+				InterlockedDecrement(&g_inflight);
+				free(pa);
+			}
 		}
-		if (!did && GetTickCount() - t0 >= (DWORD)g_windowMs)
-			break;
-		if (!did)
-			Sleep(50);
 	}
-done:
+wait:
+	/* every started probe ends by its own timeout */
+	while (g_inflight > 0 && GetTickCount() - t0 < (DWORD)g_windowMs + (DWORD)g_timeoutMs)
+		Sleep(20);
 	EnterCriticalSection(&g_wlock);
 	for (int i = 0; i < g_nworld; i++) {
 		char b[48]; DWORD tmp[MAX_PROBES]; memcpy(tmp, g_world[i].ms, sizeof tmp);
@@ -401,23 +428,48 @@ static void ini_world_list(char *out, DWORD n) { ini_get("worlds", "", out, n); 
 
 static char g_worldHosts[512];
 
-/* Runs on the probe thread: the known world addresses (DNS + the ones OctoWoW offered before). */
+/* World servers OctoWoW itself has offered in realm lists but not in DNS. Only addresses seen in a
+ * realm list belong here: a server that greets like a world server may still refuse the realm's
+ * sessions (seen on a scanned address). worlds= adds the ones seen later. */
+#define KNOWN_WORLDS "92.114.107.53:8091,92.114.107.56:8091,92.114.107.61:8091,92.114.107.62:8091," \
+	"92.114.107.47:8090,92.114.107.57:8090,92.114.107.49:8092,92.114.107.55:8092"
+
+/* Adds every entry of a comma separated list (names resolve to all their IPs); no limit but MAX_WORLD. */
+static void add_worlds(const char *csv)
+{
+	char buf[2048];
+	snprintf(buf, sizeof buf, "%s", csv);
+	for (char *tok = buf; *tok; ) {
+		char *end = tok + strcspn(tok, ",; ");
+		char keep = *end;
+		*end = 0;
+		if (*tok) {
+			Cand c[MAX_CAND];
+			int n = add_spec(c, 0, tok, "world");
+			EnterCriticalSection(&g_wlock);
+			for (int i = 0; i < n; i++)
+				world_add(c[i].a, 0);
+			LeaveCriticalSection(&g_wlock);
+		}
+		if (!keep)
+			break;
+		tok = end + 1;
+	}
+}
+
+/* Runs on the probe thread: the known world addresses (DNS, the built-in list, the ones seen before). */
 static void collect_worlds(void)
 {
-	char seen[1024];
-	ini_world_list(seen, sizeof seen);
-	Cand c[MAX_CAND * 3];
-	/* add_list keeps at most MAX_CAND; two separate lists */
-	int n = add_list(c, 0, g_worldHosts, "dns");
+	char seen[2048], known[1024];
 	EnterCriticalSection(&g_wlock);
 	g_nworld = 0;
-	for (int i = 0; i < n; i++)
-		world_add(c[i].a, 0);
 	LeaveCriticalSection(&g_wlock);
-	int m = add_list(c, 0, seen, "seen");
+	add_worlds(g_worldHosts);
+	ini_get("known_worlds", KNOWN_WORLDS, known, sizeof known);
+	add_worlds(known);
+	ini_world_list(seen, sizeof seen);
+	add_worlds(seen);
 	EnterCriticalSection(&g_wlock);
-	for (int i = 0; i < m; i++)
-		world_add(c[i].a, 0);
 	int total = g_nworld;
 	LeaveCriticalSection(&g_wlock);
 	ollog("world: testing %d known world servers for %d ms", total, g_windowMs);
@@ -441,7 +493,8 @@ static void start_world_probe(void)
 		return;
 	ini_get("world_window_ms", "8000", tmp, sizeof tmp); g_windowMs = atoi(tmp) < 1000 ? 8000 : atoi(tmp);
 	ini_get("world_rate_ms", "334", tmp, sizeof tmp); g_rateMs = atoi(tmp) < 100 ? 334 : atoi(tmp);
-	ini_get("world_timeout_ms", "1500", tmp, sizeof tmp); g_timeoutMs = atoi(tmp) < 200 ? 1500 : atoi(tmp);
+	ini_get("world_timeout_ms", "3000", tmp, sizeof tmp); g_timeoutMs = atoi(tmp) < 200 ? 3000 : atoi(tmp);
+	ini_get("world_rounds", "2", tmp, sizeof tmp); g_rounds = atoi(tmp) < 1 ? 2 : atoi(tmp) > MAX_PROBES ? MAX_PROBES : atoi(tmp);
 	memcpy(g_worldHosts, hosts, sizeof hosts);
 	ini_get("test_any_port", "0", tmp, sizeof tmp); g_anyPort = tmp[0] == '1';
 	g_probeEnd = GetTickCount() + (DWORD)g_windowMs;
@@ -475,11 +528,17 @@ static int parse_addr(const char *s, struct sockaddr_in *a)
 /* Remember the addresses the server offers in the realm list for later logins. */
 static void remember_offered(const struct sockaddr_in *a, int n)
 {
-	char cur[1024], add[64], ini[MAX_PATH + 32];
+	char cur[2048], add[64], ini[MAX_PATH + 32];
 	ini_world_list(cur, sizeof cur);
 	for (int i = 0; i < n; i++) {
 		addr_str(&a[i], add, sizeof add);
-		if (strstr(cur, add))
+		/* whole entries only ("1.2.3.4:80" is not in "11.2.3.4:80") */
+		size_t al = strlen(add);
+		int have = 0;
+		for (const char *p = cur; (p = strstr(p, add)) != NULL; p += al)
+			if ((p == cur || p[-1] == ',') && (p[al] == 0 || p[al] == ','))
+				have = 1;
+		if (have)
 			continue;
 		size_t L = strlen(cur);
 		if (L + strlen(add) + 2 >= sizeof cur)
