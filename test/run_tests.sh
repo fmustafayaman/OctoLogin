@@ -25,6 +25,7 @@ def world(port_file, mode):
     open(port_file,"w").write(str(s.getsockname()[1]))
     while True:
         c,_=s.accept()
+        with open("/tmp/ol_wcount","ab") as f: f.write(b".")  # every world connection, for the "not during login" test
         def h(c=c):
             try:
                 if mode=="fast": c.sendall(b"\x00\x06\xec\x01")
@@ -64,6 +65,7 @@ s=socket.socket(); s.bind(("127.0.0.1",0)); open("/tmp/ol_closed","w").write(str
 time.sleep(120)
 PY
 SP=$!; trap "kill $SP 2>/dev/null; rm -f /tmp/ol_silent /tmp/ol_good /tmp/ol_closed /tmp/ol_login /tmp/ol_w*" EXIT
+rm -f /tmp/ol_wcount
 for i in {1..50}; do [[ -s /tmp/ol_silent && -s /tmp/ol_good && -s /tmp/ol_closed && -s /tmp/ol_login && -s /tmp/ol_wfast && -s /tmp/ol_wslow && -s /tmp/ol_wdead && -s /tmp/ol_wnear ]] && break; sleep 0.1; done
 T=$(mktemp -d); cp dll/OctoLogin.dll test/harness.exe $T/
 (cd $T && perl -e 'alarm 60; exec @ARGV' "$WINE" harness.exe OctoLogin.dll $(cat /tmp/ol_silent) $(cat /tmp/ol_good) $(cat /tmp/ol_closed) $(cat /tmp/ol_login) $(cat /tmp/ol_wfast) $(cat /tmp/ol_wslow) $(cat /tmp/ol_wdead) $(cat /tmp/ol_wnear) 2>&1 | grep -v -i -E 'freetype|truetype'; echo "-- OctoLogin.log --"; cat OctoLogin.log)

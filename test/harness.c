@@ -27,6 +27,15 @@ static int connect_via_slot(int port, int *peer_port, DWORD *ms)
 }
 static void ini(const char *k, const char *v) { WritePrivateProfileStringA("OctoLogin", k, v, ".\\OctoLogin.ini"); }
 
+/* connections the fake world servers accepted so far (run_tests.sh appends one byte each) */
+static long world_connections(void)
+{
+	WIN32_FILE_ATTRIBUTE_DATA d;
+	if (!GetFileAttributesExA("Z:\\tmp\\ol_wcount", GetFileExInfoStandard, &d))
+		return 0;
+	return (long)d.nFileSizeLow;
+}
+
 int main(int argc, char **argv)
 {
 	if (argc < 5) { printf("usage: harness dll silent good closed [login fast slow dead near]\n"); return 2; }
@@ -101,6 +110,8 @@ int main(int argc, char **argv)
 		struct sockaddr_in a = {0}; a.sin_family = AF_INET; a.sin_port = htons(3724); a.sin_addr.s_addr = inet_addr("127.0.0.1");
 		int r = ((connect_t)*slot)(s, (struct sockaddr *)&a, sizeof a);
 		CHECK(r == 0, "connected to the login server");
+		Sleep(700); /* the client authenticates here */
+		CHECK(world_connections() == 0, "no world server is contacted while the client authenticates");
 		u_long nb = 1; ioctlsocket(s, FIONBIO, &nb);
 		DWORD t0 = GetTickCount();
 		const char req[5] = {0x10, 0, 0, 0, 0};
@@ -122,6 +133,7 @@ int main(int argc, char **argv)
 		DWORD took = GetTickCount() - t0;
 		CHECK(want > 0 && glen == want, "realm list received in full");
 		CHECK(took >= 1300 && took < 3500, "held until probing finished, then delivered");
+		CHECK(world_connections() > 0, "world servers are tested once the client asks for the realm list");
 		CHECK(maxsel <= 300, "select did not freeze the game while holding");
 		/* decode the realm address fields */
 		char addr[3][64] = {"", "", ""}; int i = 3 + 4 + 1;

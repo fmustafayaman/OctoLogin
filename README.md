@@ -20,7 +20,9 @@ Each address is tried once per login: a TCP connection and a logon challenge for
 that does not exist, so the server answers without anything being logged in. If nothing answers,
 the game's own address is used, exactly as without the mod.
 
-**World server.** While you log in, OctoLogin tests the known world servers in the background.
+**World server.** Once you are logged in and the game asks for the realm list, OctoLogin tests
+the known world servers in the background. Nothing but the login itself talks to the servers
+while the game authenticates.
 A test waits for the world server's real greeting (`SMSG_AUTH_CHALLENGE`), not just a TCP
 handshake. When the realm list arrives, each realm's address is replaced with the best server:
 fewest failed tests first, then the lowest median ping. OctoWoW's own pick is kept if it lost
@@ -36,7 +38,8 @@ OctoWoW's DDoS protection punishes bursts of new connections from one IP. OctoLo
 connects while you log in, never during play:
 
 - login: one attempt per address, at most 8 addresses;
-- world: at most 3 new connections per second for all servers together, spread over the window;
+- world: only after the login succeeded, at most 3 new connections per second for all servers
+  together, spread over the window;
 - a second login within 3 minutes reuses the results instead of testing again.
 
 ## Safety
@@ -113,6 +116,13 @@ The realm list parser and the ranking rules are ported from octoproxy.
 octoproxy is the standalone version: a local login proxy that does the same login and world
 server selection outside the game. OctoLogin replaces it; if you still run octoproxy
 (`realmlist 127.0.0.1`), OctoLogin leaves it alone.
+
+## Changes
+
+**1.0.1**: world servers are tested only after the login succeeded (when the game asks for the
+realm list), not while the game authenticates.
+
+**1.0.0**: first release.
 
 ## License
 

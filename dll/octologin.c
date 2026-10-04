@@ -18,7 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define OL_VERSION "1.0.0"
+#define OL_VERSION "1.0.1"
 #define ADDR_IAT_CONNECT 0x007FF6D0u /* WoW.exe: WSOCK32 #4 (connect) */
 #define LOGIN_PORT 3724
 #define MAX_CAND 8
@@ -346,9 +346,12 @@ static DWORD median(DWORD *v, int n)
 static int g_rateMs = 334, g_windowMs = 8000, g_timeoutMs = 1500;
 static int g_anyPort; /* tests only: treat candidates on any port as the same realm */
 
+static void collect_worlds(void);
+
 static DWORD WINAPI probe_thread(LPVOID unused)
 {
 	(void)unused;
+	collect_worlds(); /* DNS lookups happen here, not on the game's thread */
 	DWORD t0 = GetTickCount();
 	DWORD next = t0;
 	for (int round = 0;; round++) {
@@ -396,14 +399,39 @@ done:
 
 static void ini_world_list(char *out, DWORD n) { ini_get("worlds", "", out, n); }
 
-/* Called on the login connection: collects the known world addresses and starts probing. */
+static char g_worldHosts[512];
+
+/* Runs on the probe thread: the known world addresses (DNS + the ones OctoWoW offered before). */
+static void collect_worlds(void)
+{
+	char seen[1024];
+	ini_world_list(seen, sizeof seen);
+	Cand c[MAX_CAND * 3];
+	/* add_list keeps at most MAX_CAND; two separate lists */
+	int n = add_list(c, 0, g_worldHosts, "dns");
+	EnterCriticalSection(&g_wlock);
+	g_nworld = 0;
+	for (int i = 0; i < n; i++)
+		world_add(c[i].a, 0);
+	LeaveCriticalSection(&g_wlock);
+	int m = add_list(c, 0, seen, "seen");
+	EnterCriticalSection(&g_wlock);
+	for (int i = 0; i < m; i++)
+		world_add(c[i].a, 0);
+	int total = g_nworld;
+	LeaveCriticalSection(&g_wlock);
+	ollog("world: testing %d known world servers for %d ms", total, g_windowMs);
+}
+
+/* Called when the client asks for the realm list, that is after a successful login, so
+ * nothing but the login itself talks to the servers while the client authenticates. */
 static void start_world_probe(void)
 {
 	char tmp[16];
 	ini_get("world", "1", tmp, sizeof tmp);
 	if (tmp[0] == '0')
 		return;
-	char hosts[512], seen[1024];
+	char hosts[512];
 	static char lastHosts[512];
 	ini_get("world_hosts", "normal.octowow.st:8091,hc.octowow.st:8090,pvp.octowow.st:8092", hosts, sizeof hosts);
 	if (g_lastProbeDone && GetTickCount() - g_lastProbeDone < 180000 && !strcmp(hosts, lastHosts))
@@ -414,23 +442,9 @@ static void start_world_probe(void)
 	ini_get("world_window_ms", "8000", tmp, sizeof tmp); g_windowMs = atoi(tmp) < 1000 ? 8000 : atoi(tmp);
 	ini_get("world_rate_ms", "334", tmp, sizeof tmp); g_rateMs = atoi(tmp) < 100 ? 334 : atoi(tmp);
 	ini_get("world_timeout_ms", "1500", tmp, sizeof tmp); g_timeoutMs = atoi(tmp) < 200 ? 1500 : atoi(tmp);
-	ini_world_list(seen, sizeof seen);
-	Cand c[MAX_CAND * 3];
-	int n = 0;
-	/* add_list keeps at most MAX_CAND; two separate lists */
-	n = add_list(c, 0, hosts, "dns");
-	EnterCriticalSection(&g_wlock);
-	g_nworld = 0;
-	for (int i = 0; i < n; i++)
-		world_add(c[i].a, 0);
-	int m = add_list(c, 0, seen, "seen");
-	for (int i = 0; i < m; i++)
-		world_add(c[i].a, 0);
-	int total = g_nworld;
-	LeaveCriticalSection(&g_wlock);
+	memcpy(g_worldHosts, hosts, sizeof hosts);
 	ini_get("test_any_port", "0", tmp, sizeof tmp); g_anyPort = tmp[0] == '1';
 	g_probeEnd = GetTickCount() + (DWORD)g_windowMs;
-	ollog("world: testing %d known world servers for %d ms", total, g_windowMs);
 	HANDLE th = CreateThread(NULL, 0, probe_thread, NULL, 0, NULL);
 	if (th)
 		CloseHandle(th);
@@ -567,7 +581,10 @@ static void feed_client(const unsigned char *p, int n)
 		default: g_framerDead = 1; g_clen = 0; return;
 		}
 		if (!need || g_clen < need) return;
-		if (g_cbuf[0] == 0x10) g_expectRealm = 1;
+		if (g_cbuf[0] == 0x10) {
+			g_expectRealm = 1;
+			start_world_probe(); /* no-op while running or within the 3-minute cache */
+		}
 		memmove(g_cbuf, g_cbuf + need, (size_t)(g_clen - need)); g_clen -= need;
 	}
 }
@@ -727,7 +744,6 @@ static int WINAPI hook_connect(SOCKET sock, const struct sockaddr *name, int nam
 		ollog("login: nothing answered in %lu ms (%d tried); using the realmlist address", ms, m);
 	}
 	g_loginSock = sock; g_expectRealm = 0; g_framerDead = 0; g_clen = 0; g_hlen = 0;
-	start_world_probe();
 	return g_realConnect(sock, (const struct sockaddr *)&use, sizeof use);
 }
 
