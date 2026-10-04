@@ -1,0 +1,21 @@
+; OctoLogin settings. Copy to <game>/mods/OctoLogin.ini only if you want to change something;
+; every key below shows its default. OctoLogin also writes lastgood= and worlds= here itself.
+[OctoLogin]
+; 0 turns OctoLogin off completely
+enabled=1
+; login servers resolved on every login (host or host:port, comma separated)
+hosts=play.octowow.st,normal.octowow.st
+; extra login addresses that are not in DNS
+extra=185.246.188.177
+; how long the login race may take, in milliseconds
+budget_ms=3500
+; leave 127.x targets (a local proxy such as octoproxy) alone
+skiploopback=1
+; 0 turns the world server selection off
+world=1
+; world servers resolved on every login (host:port; the port decides the realm)
+world_hosts=normal.octowow.st:8091,hc.octowow.st:8090,pvp.octowow.st:8092
+; probe window, minimum time between two new probe connections, probe timeout (ms)
+world_window_ms=8000
+world_rate_ms=334
+world_timeout_ms=1500
