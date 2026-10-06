@@ -4,8 +4,10 @@
  * login addresses (the realmlist address, every IP of play/normal.octowow.st, fallbacks
  * from OctoLogin.ini and the last address that worked) are tried at the same time, once
  * each: a TCP connection plus a real logon challenge (for an account name that does not
- * exist). The first address whose login service answers is handed to the game. If none
- * answers, the game's own address is used unchanged.
+ * exist). The game's connection then goes to the first address whose login service answers,
+ * through a loopback relay that also rewrites the realm list (see "relay"). If none answers,
+ * the game's own address is used unchanged. connect is the only import of the game that is
+ * changed.
  *
  * It only acts when the target is one of the OctoWoW addresses; other servers, local
  * addresses (octoproxy) and ports other than 3724 are left alone.
@@ -18,7 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define OL_VERSION "1.0.2"
+#include "version.h"
 #define ADDR_IAT_CONNECT 0x007FF6D0u /* WoW.exe: WSOCK32 #4 (connect) */
 #define LOGIN_PORT 3724
 #define MAX_CAND 8
@@ -248,8 +250,8 @@ static const char *addr_str(const struct sockaddr_in *a, char *buf, size_t n)
  * evenly over the window). When the server sends the realm list, every realm's address is
  * replaced with the best candidate by loss, then median ping; the server's own pick is kept
  * if it lost nothing and is at most 20 ms slower than the best. A list that does not parse
- * exactly is passed through unchanged. While probing, the packet is held back without
- * freezing the game (select/recv report "no data yet"). */
+ * exactly is passed through unchanged. While probing, the relay holds the packet back; the
+ * game just sees no data yet and does not freeze. */
 #define MAX_WORLD 24
 #define MAX_PROBES 12
 typedef struct {
@@ -264,20 +266,6 @@ static CRITICAL_SECTION g_wlock;
 static volatile LONG g_probing;          /* 1: probe window running */
 static DWORD g_probeEnd;                 /* end of the window (GetTickCount) */
 static DWORD g_lastProbeDone;            /* last finished window (results reused for 3 min) */
-static SOCKET g_loginSock = INVALID_SOCKET;
-static int g_expectRealm;                /* the client asked for the realm list */
-static int g_framerDead;
-static unsigned char g_cbuf[256]; static int g_clen;   /* client stream (framer) */
-static unsigned char *g_hold; static int g_hlen, g_hcap; /* received from the server, held back */
-static unsigned char *g_out; static int g_olen, g_opos;  /* to be handed to the game (rewritten) */
-
-typedef int (WINAPI *send_t)(SOCKET, const char *, int, int);
-typedef int (WINAPI *recv_t)(SOCKET, char *, int, int);
-typedef int (WINAPI *select_t)(int, fd_set *, fd_set *, fd_set *, const struct timeval *);
-typedef int (WINAPI *ioctl_t)(SOCKET, long, u_long *);
-typedef int (WINAPI *close_t)(SOCKET);
-static send_t g_realSend; static recv_t g_realRecv; static select_t g_realSelect;
-static ioctl_t g_realIoctl; static close_t g_realClose;
 
 static int world_index(const struct sockaddr_in *a)
 {
@@ -624,122 +612,208 @@ static unsigned char *rewrite(const unsigned char *pkt, int len, int *outlen)
 	return o;
 }
 
+/* ---------------------------------------------------------------- relay
+ * The game's login connection runs through a relay on the loopback interface, inside the game
+ * process (the same model as octoproxy with realmlist 127.0.0.1): the game connects to
+ * 127.0.0.1:<port>, the relay connects to the chosen login server and copies the bytes both
+ * ways. Only the connect import of the game is changed; the relay uses its own sockets. */
+typedef struct {
+	SOCKET lis, up, cl;                    /* listener, login server, game */
+	unsigned char cbuf[256]; int clen;     /* client stream (framer) */
+	int framerDead, expectRealm;           /* expectRealm: the client asked for the realm list */
+	unsigned char *hold; int hlen, hcap;   /* received from the server, held back */
+} Relay;
+
 /* client stream: find the realm list request (octoproxy's clientFramer) */
-static void feed_client(const unsigned char *p, int n)
+static void feed_client(Relay *R, const unsigned char *p, int n)
 {
-	if (g_framerDead) return;
-	if (g_clen + n > (int)sizeof g_cbuf) { g_framerDead = 1; return; }
-	memcpy(g_cbuf + g_clen, p, (size_t)n); g_clen += n;
-	while (g_clen > 0) {
+	if (R->framerDead) return;
+	if (R->clen + n > (int)sizeof R->cbuf) { R->framerDead = 1; return; }
+	memcpy(R->cbuf + R->clen, p, (size_t)n); R->clen += n;
+	while (R->clen > 0) {
 		int need;
-		switch (g_cbuf[0]) {
-		case 0x00: case 0x02: need = g_clen < 4 ? 0 : 4 + (g_cbuf[2] | g_cbuf[3] << 8); break;
+		switch (R->cbuf[0]) {
+		case 0x00: case 0x02: need = R->clen < 4 ? 0 : 4 + (R->cbuf[2] | R->cbuf[3] << 8); break;
 		case 0x01: need = 1 + 32 + 20 + 20 + 1 + 1; break;
 		case 0x03: need = 1 + 16 + 20 + 20 + 1; break;
 		case 0x10: need = 5; break;
-		default: g_framerDead = 1; g_clen = 0; return;
+		default: R->framerDead = 1; R->clen = 0; return;
 		}
-		if (!need || g_clen < need) return;
-		if (g_cbuf[0] == 0x10) {
-			g_expectRealm = 1;
+		if (!need || R->clen < need) return;
+		if (R->cbuf[0] == 0x10) {
+			R->expectRealm = 1;
 			start_world_probe(); /* no-op while running or within the 3-minute cache */
 		}
-		memmove(g_cbuf, g_cbuf + need, (size_t)(g_clen - need)); g_clen -= need;
+		memmove(R->cbuf, R->cbuf + need, (size_t)(R->clen - need)); R->clen -= need;
 	}
 }
 
-static int WINAPI hook_send(SOCKET s, const char *b, int n, int f)
+static int send_all(SOCKET s, const unsigned char *b, int n)
 {
-	int r = g_realSend(s, b, n, f);
-	if (s == g_loginSock && r > 0)
-		feed_client((const unsigned char *)b, r);
-	return r;
+	while (n > 0) {
+		int k = send(s, (const char *)b, n, 0);
+		if (k <= 0)
+			return 0;
+		b += k; n -= k;
+	}
+	return 1;
 }
 
-static void hold_append(const char *b, int n)
+static int hold_append(Relay *R, const unsigned char *b, int n)
 {
-	if (g_hlen + n > g_hcap) { int c = (g_hlen + n) * 2; unsigned char *x = realloc(g_hold, (size_t)c); if (!x) return; g_hold = x; g_hcap = c; }
-	memcpy(g_hold + g_hlen, b, (size_t)n); g_hlen += n;
+	if (R->hlen + n > R->hcap) {
+		int c = (R->hlen + n) * 2;
+		unsigned char *x = realloc(R->hold, (size_t)c);
+		if (!x) return 0;
+		R->hold = x; R->hcap = c;
+	}
+	memcpy(R->hold + R->hlen, b, (size_t)n); R->hlen += n;
+	return 1;
 }
 
-/* once the held packet is complete and probing has finished, prepare the output */
-static void try_release(void)
+/* Hands the held realm list to the game once it is complete and probing has finished
+ * (force: the server closed, hand over whatever there is). 0 if the game is gone. */
+static int try_release(Relay *R, int force)
 {
-	if (g_olen || g_hlen < 3) return;
-	int want = 3 + (g_hold[1] | g_hold[2] << 8);
-	if (g_hlen < want) return;
-	if (g_probing && (LONG)(g_probeEnd - GetTickCount()) > 0) return; /* still probing: keep holding */
-	int on = 0;
-	unsigned char *o = rewrite(g_hold, want, &on);
-	if (!o) { ollog("world: realm list not recognised, passed through unchanged"); o = malloc((size_t)want); memcpy(o, g_hold, (size_t)want); on = want; }
+	if (!R->hlen) return 1;
+	int want = R->hlen >= 3 ? 3 + (R->hold[1] | R->hold[2] << 8) : -1;
+	if (want < 0 || R->hlen < want) {
+		if (!force) return 1;
+		int ok = send_all(R->cl, R->hold, R->hlen); /* incomplete: as it came */
+		R->hlen = 0;
+		return ok;
+	}
+	if (!force && g_probing && (LONG)(g_probeEnd - GetTickCount()) > 0) return 1; /* still probing: keep holding */
+	int on = 0, ok;
+	unsigned char *o = rewrite(R->hold, want, &on);
+	if (o) {
+		ok = send_all(R->cl, o, on);
+		free(o);
+	} else {
+		ollog("world: realm list not recognised, passed through unchanged");
+		ok = send_all(R->cl, R->hold, want);
+	}
 	/* bytes that arrived after the packet go behind it */
-	int extra = g_hlen - want;
-	unsigned char *full = malloc((size_t)(on + extra));
-	memcpy(full, o, (size_t)on); memcpy(full + on, g_hold + want, (size_t)extra); free(o);
-	g_out = full; g_olen = on + extra; g_opos = 0; g_hlen = 0; g_expectRealm = 0;
+	if (ok && R->hlen > want)
+		ok = send_all(R->cl, R->hold + want, R->hlen - want);
+	R->hlen = 0; R->expectRealm = 0;
+	return ok;
 }
 
-static int pending(SOCKET s) { return s == g_loginSock && (g_hlen > 0 || g_olen > 0); }
-
-static int WINAPI hook_recv(SOCKET s, char *b, int n, int f)
+/* data from the login server: passed on, except the realm list, which is held for rewriting */
+static int from_server(Relay *R, const unsigned char *b, int n)
 {
-	if (s != g_loginSock || (!g_expectRealm && !g_olen && !g_hlen))
-		return g_realRecv(s, b, n, f);
-	if (g_olen) {
-		int k = g_olen - g_opos < n ? g_olen - g_opos : n;
-		memcpy(b, g_out + g_opos, (size_t)k); g_opos += k;
-		if (g_opos >= g_olen) { free(g_out); g_out = NULL; g_olen = g_opos = 0; }
-		return k;
+	if (!R->hlen && (!R->expectRealm || b[0] != 0x10)) {
+		R->expectRealm = 0;
+		return send_all(R->cl, b, n);
 	}
-	/* hold back everything from the server */
-	char tmp[4096];
-	int r = g_realRecv(s, tmp, sizeof tmp, f);
-	if (r > 0) {
-		if (!g_hlen && (unsigned char)tmp[0] != 0x10) { g_expectRealm = 0; int k = r < n ? r : n; memcpy(b, tmp, (size_t)k); if (k < r) { g_out = malloc((size_t)(r - k)); memcpy(g_out, tmp + k, (size_t)(r - k)); g_olen = r - k; } return k; }
-		hold_append(tmp, r);
-	} else if (r == 0 || (r < 0 && WSAGetLastError() != WSAEWOULDBLOCK)) {
-		if (!g_hlen) return r;
+	if (!hold_append(R, b, n)) { /* out of memory: give up rewriting */
+		int ok = send_all(R->cl, R->hold, R->hlen) && send_all(R->cl, b, n);
+		R->hlen = 0; R->expectRealm = 0;
+		return ok;
 	}
-	try_release();
-	if (g_olen) return hook_recv(s, b, n, f);
-	WSASetLastError(WSAEWOULDBLOCK);
-	return SOCKET_ERROR;
+	return try_release(R, 0);
 }
 
-static int WINAPI hook_select(int nfds, fd_set *rd, fd_set *wr, fd_set *ex, const struct timeval *tv)
+static DWORD WINAPI relay_thread(LPVOID p)
 {
-	if (g_loginSock == INVALID_SOCKET || !rd || !FD_ISSET(g_loginSock, rd) || !pending(g_loginSock))
-		return g_realSelect(nfds, rd, wr, ex, tv);
-	try_release();
-	if (g_olen) { /* data ready: report only this socket as readable */
-		FD_ZERO(rd); FD_SET(g_loginSock, rd);
-		if (wr) FD_ZERO(wr);
-		if (ex) FD_ZERO(ex);
-		return 1;
+	Relay *R = p;
+	fd_set rd; FD_ZERO(&rd); FD_SET(R->lis, &rd);
+	struct timeval tv = {10, 0}; /* the game connects right after the hook returns */
+	if (select(0, &rd, NULL, NULL, &tv) > 0)
+		R->cl = accept(R->lis, NULL, NULL);
+	closesocket(R->lis);
+	if (R->cl == INVALID_SOCKET) {
+		ollog("relay: the game did not connect");
+		goto done;
 	}
-	/* held: a real select to receive the rest, with a short timeout */
-	struct timeval t = {0, 50000};
-	int r = g_realSelect(nfds, rd, wr, ex, &t);
-	return r;
+	int upOpen = 1;
+	unsigned char buf[4096];
+	for (;;) {
+		FD_ZERO(&rd);
+		FD_SET(R->cl, &rd);
+		if (upOpen) FD_SET(R->up, &rd);
+		struct timeval t = {0, 50000}; /* while holding: check for the end of probing */
+		if (select(0, &rd, NULL, NULL, R->hlen ? &t : NULL) < 0)
+			break;
+		if (FD_ISSET(R->cl, &rd)) {
+			int k = recv(R->cl, (char *)buf, sizeof buf, 0);
+			if (k <= 0)
+				break; /* the game closed the login connection */
+			feed_client(R, buf, k);
+			if (!upOpen || !send_all(R->up, buf, k))
+				break;
+		}
+		if (upOpen && FD_ISSET(R->up, &rd)) {
+			int k = recv(R->up, (char *)buf, sizeof buf, 0);
+			if (k <= 0) {
+				upOpen = 0;
+				shutdown(R->up, SD_RECEIVE);
+			} else if (!from_server(R, buf, k))
+				break;
+		}
+		if (!try_release(R, !upOpen))
+			break;
+		if (!upOpen && !R->hlen) {
+			shutdown(R->cl, SD_SEND); /* the server closed: let the game see it */
+			Sleep(100);
+			break;
+		}
+	}
+	closesocket(R->cl);
+done:
+	closesocket(R->up);
+	free(R->hold);
+	free(R);
+	return 0;
 }
 
-static int WINAPI hook_ioctl(SOCKET s, long cmd, u_long *arg)
+/* Connects to the login server and starts a relay to it; fills the loopback address the game
+ * should connect to. 0 if the server cannot be reached (the game then connects directly). */
+static int relay_start(const struct sockaddr_in *srv, struct sockaddr_in *local)
 {
-	if (cmd == (long)FIONREAD && pending(s) && arg) {
-		try_release();
-		*arg = (u_long)(g_olen ? g_olen - g_opos : 0);
+	char b[48];
+	SOCKET up = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+	if (up == INVALID_SOCKET)
+		return 0;
+	u_long nb = 1;
+	ioctlsocket(up, FIONBIO, &nb);
+	int r = g_realConnect(up, (const struct sockaddr *)srv, sizeof *srv);
+	if (r != 0 && WSAGetLastError() == WSAEWOULDBLOCK) {
+		fd_set w, e; FD_ZERO(&w); FD_ZERO(&e); FD_SET(up, &w); FD_SET(up, &e);
+		struct timeval tv = {5, 0};
+		r = select(0, NULL, &w, &e, &tv) == 1 && FD_ISSET(up, &w) ? 0 : -1;
+	}
+	nb = 0;
+	if (r != 0 || ioctlsocket(up, FIONBIO, &nb) != 0) {
+		ollog("relay: %s did not accept the connection; the game connects directly", addr_str(srv, b, sizeof b));
+		closesocket(up);
 		return 0;
 	}
-	return g_realIoctl(s, cmd, arg);
-}
-
-static int WINAPI hook_close(SOCKET s)
-{
-	if (s == g_loginSock) {
-		g_loginSock = INVALID_SOCKET; g_expectRealm = 0; g_framerDead = 0; g_clen = 0; g_hlen = 0;
-		free(g_out); g_out = NULL; g_olen = g_opos = 0;
+	SOCKET lis = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+	memset(local, 0, sizeof *local);
+	local->sin_family = AF_INET;
+	local->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	int ll = sizeof *local;
+	Relay *R = calloc(1, sizeof *R);
+	if (lis == INVALID_SOCKET || !R || bind(lis, (struct sockaddr *)local, sizeof *local) != 0 || listen(lis, 1) != 0
+	    || getsockname(lis, (struct sockaddr *)local, &ll) != 0) {
+		ollog("relay: no local port (error %d); the game connects directly", WSAGetLastError());
+		goto fail;
 	}
-	return g_realClose(s);
+	R->lis = lis; R->up = up; R->cl = INVALID_SOCKET;
+	HANDLE th = CreateThread(NULL, 0, relay_thread, R, 0, NULL);
+	if (!th) {
+		ollog("relay: no thread; the game connects directly");
+		goto fail;
+	}
+	CloseHandle(th);
+	return 1;
+fail:
+	if (lis != INVALID_SOCKET) closesocket(lis);
+	closesocket(up);
+	free(R);
+	return 0;
 }
 
 /* ---------------------------------------------------------------- connect hook */
@@ -801,27 +875,15 @@ static int WINAPI hook_connect(SOCKET sock, const struct sockaddr *name, int nam
 		ollog("login: no login service answered in %lu ms; using %s (TCP open, %s)", ms, addr_str(&use, buf, sizeof buf), o[-w - 2].why);
 	} else {
 		ollog("login: nothing answered in %lu ms (%d tried); using the realmlist address", ms, m);
+		return g_realConnect(sock, name, namelen);
 	}
-	g_loginSock = sock; g_expectRealm = 0; g_framerDead = 0; g_clen = 0; g_hlen = 0;
-	return g_realConnect(sock, (const struct sockaddr *)&use, sizeof use);
+	struct sockaddr_in local;
+	if (!relay_start(&use, &local))
+		return g_realConnect(sock, (const struct sockaddr *)&use, sizeof use);
+	return g_realConnect(sock, (const struct sockaddr *)&local, sizeof local);
 }
 
 /* ---------------------------------------------------------------- install */
-static int hook_slot(HMODULE ws, int ord, uintptr_t addr, void *hook, void **orig)
-{
-	FARPROC want = GetProcAddress(ws, MAKEINTRESOURCEA(ord));
-	void **slot = (void **)addr;
-	if (!want || *slot != (void *)want)
-		return 0;
-	*orig = (void *)want;
-	DWORD old;
-	if (!VirtualProtect(slot, sizeof *slot, PAGE_READWRITE, &old))
-		return 0;
-	*slot = hook;
-	VirtualProtect(slot, sizeof *slot, old, &old);
-	return 1;
-}
-
 static int install(void)
 {
 	HMODULE ws = GetModuleHandleA("wsock32.dll");
@@ -844,22 +906,7 @@ static int install(void)
 		return 0;
 	*slot = (void *)hook_connect;
 	VirtualProtect(slot, sizeof *slot, old, &old);
-	/* world server: send/recv/select/ioctlsocket/closesocket (all of them or none) */
-	void *o1, *o2, *o3, *o4, *o5;
-	void **sl[] = {(void **)0x007FF70Cu, (void **)0x007FF714u, (void **)0x007FF708u, (void **)0x007FF718u, (void **)0x007FF704u};
-	int ords[] = {19, 16, 18, 10, 3};
-	int okall = 1;
-	for (int i = 0; i < 5; i++) {
-		FARPROC w = GetProcAddress(ws, MAKEINTRESOURCEA(ords[i]));
-		if (!w || *sl[i] != (void *)w) okall = 0;
-	}
-	if (okall && hook_slot(ws, 19, 0x007FF70Cu, (void *)hook_send, &o1) && hook_slot(ws, 16, 0x007FF714u, (void *)hook_recv, &o2)
-	    && hook_slot(ws, 18, 0x007FF708u, (void *)hook_select, &o3) && hook_slot(ws, 10, 0x007FF718u, (void *)hook_ioctl, &o4)
-	    && hook_slot(ws, 3, 0x007FF704u, (void *)hook_close, &o5)) {
-		g_realSend = (send_t)o1; g_realRecv = (recv_t)o2; g_realSelect = (select_t)o3; g_realIoctl = (ioctl_t)o4; g_realClose = (close_t)o5;
-		ollog("OctoLogin %s: ready (login + world)", OL_VERSION);
-	} else
-		ollog("OctoLogin %s: ready (login only; world hooks unavailable)", OL_VERSION);
+	ollog("OctoLogin %s: ready", OL_VERSION);
 	return 1;
 }
 

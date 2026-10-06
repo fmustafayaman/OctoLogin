@@ -12,7 +12,9 @@ static int fails, total;
 __attribute__((section(".wowiat"), used)) void *wow_iat[0x400] = {(void *)1};
 static void **slot = (void **)(uintptr_t)0x007FF6D0;
 
-static int connect_via_slot(int port, int *peer_port, DWORD *ms)
+/* Connects through the hooked import slot like the game does. *answered: a logon challenge sent
+ * over the connection got the fake login server's reply (00 00 04) within a second. */
+static int connect_via_slot(int port, int *peer_port, DWORD *ms, int *answered)
 {
 	SOCKET s = socket(AF_INET, SOCK_STREAM, 0);
 	struct sockaddr_in a = {0};
@@ -22,9 +24,26 @@ static int connect_via_slot(int port, int *peer_port, DWORD *ms)
 	*ms = GetTickCount() - t;
 	struct sockaddr_in p; int pl = sizeof p;
 	*peer_port = (r == 0 && getpeername(s, (struct sockaddr *)&p, &pl) == 0) ? ntohs(p.sin_port) : -1;
+	if (answered) {
+		*answered = 0;
+		const char chal[8] = {0x00, 0x03, 0x04, 0x00, 'T', 'E', 'S', 'T'};
+		if (r == 0 && send(s, chal, sizeof chal, 0) == sizeof chal) {
+			fd_set rd; FD_ZERO(&rd); FD_SET(s, &rd);
+			struct timeval tv = {1, 0};
+			unsigned char b[3]; int got = 0;
+			while (got < 3 && select(0, &rd, NULL, NULL, &tv) == 1) {
+				int k = recv(s, (char *)b + got, 3 - got, 0);
+				if (k <= 0) break;
+				got += k;
+			}
+			*answered = got == 3 && b[0] == 0 && b[1] == 0 && b[2] == 4;
+		}
+	}
 	closesocket(s);
 	return r;
 }
+static int is_server_port(int p, const int *ports, int n) { for (int i = 0; i < n; i++) if (p == ports[i]) return 1; return 0; }
+static void read_log(char *log, size_t n) { log[0] = 0; FILE *f = fopen("OctoLogin.log", "r"); if (f) { size_t k = fread(log, 1, n - 1, f); log[k] = 0; fclose(f); } }
 static void ini(const char *k, const char *v) { WritePrivateProfileStringA("OctoLogin", k, v, ".\\OctoLogin.ini"); }
 
 /* connections the fake world servers accepted so far (run_tests.sh appends one byte each) */
@@ -56,10 +75,17 @@ int main(int argc, char **argv)
 	HMODULE h = LoadLibraryA(argv[1]);
 	CHECK(h != NULL, "DLL loaded");
 	CHECK(*slot != (void *)real, "connect import slot points to the hook");
-	int peer; DWORD ms;
+	{
+		int untouched = 1;
+		for (int i = 0; i < 5; i++) if (*(void **)at[i] != (void *)GetProcAddress(wsk, MAKEINTRESOURCEA(ords[i]))) untouched = 0;
+		CHECK(untouched, "send/recv/select/ioctlsocket/closesocket import slots are untouched");
+	}
+	int peer, ans; DWORD ms;
+	int servers[] = {SILENT, GOOD, CLOSED, 3724};
 	printf("== login: pick between a silent, a closed and a working server\n");
-	connect_via_slot(3724, &peer, &ms);
-	CHECK(peer == GOOD, "connected to the server that answered");
+	connect_via_slot(3724, &peer, &ms, &ans);
+	CHECK(peer > 0 && !is_server_port(peer, servers, 4), "the game's connection goes to the local relay");
+	CHECK(ans, "the relay carries the login to the server that answered");
 	CHECK(ms < 2000, "decided before the time budget ran out");
 	char last[64]; GetPrivateProfileStringA("OctoLogin", "lastgood", "", last, sizeof last, ".\\OctoLogin.ini");
 	char want[64]; snprintf(want, sizeof want, "127.0.0.1:%d", GOOD);
@@ -74,33 +100,29 @@ int main(int argc, char **argv)
 	}
 	printf("== port other than 3724\n");
 	ini("extra", extra);
-	connect_via_slot(GOOD, &peer, &ms);
+	connect_via_slot(GOOD, &peer, &ms, NULL);
 	CHECK(peer == GOOD && ms < 300, "other ports connect directly (no probing)");
 	printf("== nothing answers\n");
 	char dead[100]; snprintf(dead, sizeof dead, "127.0.0.1:3724,127.0.0.1:%d,127.0.0.1:%d", SILENT, CLOSED);
 	ini("extra", dead); ini("lastgood", "");
-	connect_via_slot(3724, &peer, &ms);
-	CHECK(peer == SILENT, "without a login service, the address whose TCP opened is used");
+	connect_via_slot(3724, &peer, &ms, NULL);
+	{ char log[4096], want2[96]; read_log(log, sizeof log); snprintf(want2, sizeof want2, "using 127.0.0.1:%d (TCP open", SILENT);
+	  CHECK(peer > 0 && !is_server_port(peer, servers, 4) && strstr(log, want2) != NULL, "without a login service, the address whose TCP opened is used (relayed)"); }
 	CHECK(ms >= 1900 && ms < 2600, "waited for the budget, not longer");
 	printf("== can be turned off\n");
 	ini("extra", extra); ini("enabled", "0");
-	connect_via_slot(3724, &peer, &ms);
+	connect_via_slot(3724, &peer, &ms, NULL);
 	CHECK(peer == -1 && ms < 1500, "enabled=0 uses the game's address");
 	printf("== local proxy\n");
 	ini("enabled", "1"); ini("skiploopback", "1");
-	connect_via_slot(3724, &peer, &ms);
-	{ char log[4096] = ""; FILE *f = fopen("OctoLogin.log", "r"); if (f) { size_t k = fread(log, 1, sizeof log - 1, f); log[k] = 0; fclose(f); }
+	connect_via_slot(3724, &peer, &ms, NULL);
+	{ char log[4096]; read_log(log, sizeof log);
 	  CHECK(peer == -1 && strstr(log, "local proxy, left alone") != NULL, "a 127.x target (octoproxy) is left alone"); }
 
 	printf("== world server (realm list)\n");
 	if (argc < 10) { printf("  skipped (no world server ports)\n"); goto end; }
 	{
 		int LSRV = atoi(argv[5]), WFAST = atoi(argv[6]), WSLOW = atoi(argv[7]), WDEAD = atoi(argv[8]), WNEAR = atoi(argv[9]);
-		typedef int (WINAPI *send_t)(SOCKET, const char *, int, int);
-		typedef int (WINAPI *recv_t)(SOCKET, char *, int, int);
-		typedef int (WINAPI *select_t)(int, fd_set *, fd_set *, fd_set *, const struct timeval *);
-		typedef int (WINAPI *close_t)(SOCKET);
-		CHECK(*(void **)0x7FF714 != (void *)GetProcAddress(wsk, MAKEINTRESOURCEA(16)), "recv import slot points to the hook");
 		char ex[160], wh[260];
 		snprintf(ex, sizeof ex, "127.0.0.1:3724,127.0.0.1:%d", LSRV);
 		snprintf(wh, sizeof wh, "127.0.0.1:%d,127.0.0.1:%d,127.0.0.1:%d,127.0.0.1:%d", WFAST, WSLOW, WDEAD, WNEAR);
@@ -118,17 +140,17 @@ int main(int argc, char **argv)
 		u_long nb = 1; ioctlsocket(s, FIONBIO, &nb);
 		DWORD t0 = GetTickCount();
 		const char req[5] = {0x10, 0, 0, 0, 0};
-		((send_t)*(void **)0x7FF70C)(s, req, 5, 0);
+		send(s, req, 5, 0);
 		unsigned char got[2048]; int glen = 0, want = -1, maxsel = 0;
 		while (GetTickCount() - t0 < 6000) {
 			fd_set rd; FD_ZERO(&rd); FD_SET(s, &rd);
 			struct timeval tv = {0, 200000};
 			DWORD ts = GetTickCount();
-			int k = ((select_t)*(void **)0x7FF708)(0, &rd, NULL, NULL, &tv);
+			int k = select(0, &rd, NULL, NULL, &tv);
 			if ((int)(GetTickCount() - ts) > maxsel) maxsel = (int)(GetTickCount() - ts);
 			if (k <= 0 || !FD_ISSET(s, &rd)) continue;
 			int chunk = glen < 3 ? 3 - glen : 17;   /* small reads: the header first, then 17 bytes at a time */
-			int n = ((recv_t)*(void **)0x7FF714)(s, (char *)got + glen, chunk, 0);
+			int n = recv(s, (char *)got + glen, chunk, 0);
 			if (n > 0) glen += n;
 			if (glen >= 3 && want < 0) want = 3 + (got[1] | got[2] << 8);
 			if (want > 0 && glen >= want) break;
@@ -138,7 +160,7 @@ int main(int argc, char **argv)
 		/* the dead server's tests end by their 500 ms timeout; the window is 1500 ms */
 		CHECK(took >= 500 && took < 1500 + 800, "held until every test finished (not longer than the window), then delivered");
 		CHECK(world_connections() > 0, "world servers are tested once the client asks for the realm list");
-		{ char log[8192] = ""; FILE *f = fopen("OctoLogin.log", "r"); if (f) { size_t k = fread(log, 1, sizeof log - 1, f); log[k] = 0; fclose(f); }
+		{ char log[8192]; read_log(log, sizeof log);
 		  CHECK(strstr(log, "testing 13 known world servers") != NULL, "every listed world server is used (4 from DNS + 9 known, no 8-entry limit)");
 		  CHECK(strstr(log, "92.114.107") == NULL, "no real OctoWoW server was contacted by the tests"); }
 		CHECK(maxsel <= 300, "select did not freeze the game while holding");
@@ -158,7 +180,14 @@ int main(int argc, char **argv)
 		char seen[512]; GetPrivateProfileStringA("OctoLogin", "worlds", "", seen, sizeof seen, ".\\OctoLogin.ini");
 		char wd[64]; snprintf(wd, 64, "127.0.0.1:%d", WDEAD);
 		CHECK(strstr(seen, wd) != NULL, "offered addresses are remembered for later logins");
-		((close_t)*(void **)0x7FF704)(s);
+		{   /* the fake login server closes 1 s after the realm list: the game must see the close */
+			nb = 0; ioctlsocket(s, FIONBIO, &nb);
+			fd_set rd; FD_ZERO(&rd); FD_SET(s, &rd);
+			struct timeval tv = {3, 0}; char b[16];
+			int k = select(0, &rd, NULL, NULL, &tv) == 1 ? recv(s, b, sizeof b, 0) : -2;
+			CHECK(k == 0, "when the login server closes, the game's connection closes too");
+		}
+		closesocket(s);
 	}
 end:
 	printf("\n%d/%d tests passed\n", total - fails, total);

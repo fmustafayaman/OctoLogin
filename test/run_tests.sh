@@ -5,7 +5,7 @@ set -e
 cd "${0:A:h}/.."
 WINE=${WINE:-/Applications/WoWSilicon.app/Contents/Resources/Wine/bin/wine}
 export WINEDEBUG=-all DYLD_LIBRARY_PATH=${DYLD_LIBRARY_PATH:-/Applications/WoWSilicon.app/Contents/Resources/Wine/lib/external} WINEPREFIX=${WINEPREFIX:-$HOME/.cache/hdtoggle-wine}
-i686-w64-mingw32-gcc -O2 -Wall -Wextra -Werror -std=c11 -shared -s -static-libgcc -mcrtdll=msvcrt-os -o dll/OctoLogin.dll dll/octologin.c -lws2_32
+./build.sh
 i686-w64-mingw32-gcc -O1 -s -Wall -std=c11 -static-libgcc -mcrtdll=msvcrt-os -Wl,--image-base,0x400000 -Wl,--section-start=.wowiat=0x007FF000 -o test/harness.exe test/harness.c -lws2_32
 python3 - <<'PY' &
 import socket, threading, time, os

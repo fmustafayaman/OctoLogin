@@ -51,8 +51,8 @@ connects while you log in, never during play:
   other ports and local addresses (`127.x`, for a proxy such as octoproxy) are left alone.
 - A realm list that does not decode exactly is passed through unchanged. The worst case is a
   normal login.
-- It patches the game's Winsock import table only if the entries are untouched; if another mod
-  already hooked them, OctoLogin does nothing.
+- It changes a single entry of the game's import table, `connect`, and only if it is
+  untouched; if another mod already hooked it, OctoLogin does nothing.
 
 ## Install
 
@@ -87,13 +87,13 @@ Needs MinGW-w64 (`i686-w64-mingw32-gcc`).
 
 ```sh
 ./build.sh              # dll/OctoLogin.dll
-./test/run_tests.sh     # 21 tests under Wine with local fake login and world servers
+./test/run_tests.sh     # 27 tests under Wine with local fake login and world servers
 ```
 
 The test harness places fake Winsock import slots at the same addresses as `WoW.exe`, then
 plays the game's side of the login: it picks between silent, closed and working login servers,
-reads the realm list in small pieces through the hooked `select`/`recv`, and checks which world
-server each realm gets.
+checks that the login runs through the relay, reads the realm list in small pieces and checks
+which world server each realm gets.
 
 `test/live_test.c` makes one login attempt against the real OctoWoW login servers (world testing
 off). Use it sparingly.
@@ -101,16 +101,15 @@ off). Use it sparingly.
 ## How it works
 
 `WoW.exe` (1.12.1, build 5875) imports Winsock from `WSOCK32.dll` by ordinal. OctoLogin replaces
-these import table entries:
+one import table entry, `connect` (`0x7FF6D0`). The rest of the game's networking is untouched.
 
-| Slot       | Function    | Used for |
-|------------|-------------|----------|
-| `0x7FF6D0` | connect     | login race, start of world testing |
-| `0x7FF70C` | send        | spotting the client's realm list request |
-| `0x7FF714` | recv        | holding back and rewriting the realm list |
-| `0x7FF708` | select      | reporting "no data yet" while the list is held |
-| `0x7FF718` | ioctlsocket | the same for `FIONREAD` |
-| `0x7FF704` | closesocket | forgetting the login connection |
+When the game connects to an OctoWoW login address, OctoLogin runs the login race, connects to
+the winner and starts a small relay on the loopback interface (`127.0.0.1`, a random port, inside
+the game process). The game is connected to the relay, which copies the login traffic both ways,
+the same way octoproxy does with `realmlist 127.0.0.1`. The relay watches the game's side only for
+the realm list request, and holds back the server's realm list reply until the world tests are
+done, then rewrites it. Everything else passes through byte for byte. The world server
+connection is made by the game directly, without the relay.
 
 The realm list parser and the ranking rules are ported from octoproxy.
 
@@ -121,6 +120,14 @@ server selection outside the game. OctoLogin replaces it; if you still run octop
 (`realmlist 127.0.0.1`), OctoLogin leaves it alone.
 
 ## Changes
+
+**1.1.0**
+- Only the game's `connect` is hooked. The login connection runs through a loopback relay
+  inside the game instead of hooking `send`, `recv`, `select`, `ioctlsocket` and
+  `closesocket`. Hooking those in `WoW.exe` is what old WoW password stealers did, and a few
+  antivirus engines flagged 1.0.2 for it (false positive). OctoLogin never read or sent any
+  account data, and still does not.
+- The DLL carries version information (product, version, license, source link).
 
 **1.0.2**
 - World tests no longer wait for each other: a slow server (or a slow VPN) cannot use up the

@@ -23,7 +23,16 @@ int main(int argc, char **argv)
 	DWORD t = GetTickCount();
 	int r = ((connect_t)*(void **)0x7FF6D0)(s, (struct sockaddr *)&a, sizeof a);
 	struct sockaddr_in p; int pl = sizeof p; getpeername(s, (struct sockaddr *)&p, &pl);
-	printf("game target %s -> connected to %s:%d, result %d, %lu ms\n", inet_ntoa(a.sin_addr), inet_ntoa(p.sin_addr), ntohs(p.sin_port), r, GetTickCount() - t);
+	char target[16]; snprintf(target, sizeof target, "%s", inet_ntoa(a.sin_addr)); /* inet_ntoa reuses one buffer */
+	printf("game target %s -> connected to %s:%d, result %d, %lu ms\n", target, inet_ntoa(p.sin_addr), ntohs(p.sin_port), r, GetTickCount() - t);
+	/* through the relay: a logon challenge for an account name that does not exist */
+	static const unsigned char chal[] = {0x00, 0x03, 0x27, 0x00, 'W', 'o', 'W', 0, 1, 12, 1, 0xF3, 0x16, '6', '8', 'x', 0,
+		'n', 'i', 'W', 0, 'S', 'U', 'n', 'e', 0, 0, 0, 0, 127, 0, 0, 1, 9, 'O', 'C', 'T', 'O', 'L', 'O', 'G', 'I', 'N'};
+	unsigned char b[3] = {0xFF, 0xFF, 0xFF};
+	fd_set rd; FD_ZERO(&rd); FD_SET(s, &rd); struct timeval tv = {5, 0};
+	int got = r == 0 && send(s, (const char *)chal, sizeof chal, 0) == sizeof chal && select(0, &rd, NULL, NULL, &tv) == 1 ? recv(s, (char *)b, 3, 0) : -1;
+	printf("logon challenge through the relay: %d bytes, reply %02X %02X %02X (%s)\n", got, b[0], b[1], b[2],
+		got >= 2 && b[0] == 0x00 ? "login server answered" : "NO ANSWER");
 	closesocket(s);
 	return 0;
 }

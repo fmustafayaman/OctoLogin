@@ -1,0 +1,32 @@
+#include <winver.h>
+#include "version.h"
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION     OL_VER_MAJOR, OL_VER_MINOR, OL_VER_PATCH, 0
+PRODUCTVERSION  OL_VER_MAJOR, OL_VER_MINOR, OL_VER_PATCH, 0
+FILEFLAGSMASK   VS_FFI_FILEFLAGSMASK
+FILEFLAGS       0
+FILEOS          VOS_NT_WINDOWS32
+FILETYPE        VFT_DLL
+FILESUBTYPE     VFT2_UNKNOWN
+BEGIN
+	BLOCK "StringFileInfo"
+	BEGIN
+		BLOCK "040904B0"
+		BEGIN
+			VALUE "CompanyName",      "Mustafa Yaman"
+			VALUE "FileDescription",  "OctoLogin: login and world server selection for OctoWoW (WoW 1.12.1)"
+			VALUE "FileVersion",      OL_VERSION
+			VALUE "InternalName",     "OctoLogin"
+			VALUE "LegalCopyright",   "Copyright (c) 2026 Mustafa Yaman. MIT License."
+			VALUE "OriginalFilename", "OctoLogin.dll"
+			VALUE "ProductName",      "OctoLogin"
+			VALUE "ProductVersion",   OL_VERSION
+			VALUE "Comments",         "Open source: https://github.com/fmustafayaman/OctoLogin"
+		END
+	END
+	BLOCK "VarFileInfo"
+	BEGIN
+		VALUE "Translation", 0x0409, 1200
+	END
+END
