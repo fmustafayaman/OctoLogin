@@ -1,0 +1,5 @@
+*
+!build.sh
+!dll/octologin.c
+!dll/octologin.rc
+!dll/version.h
