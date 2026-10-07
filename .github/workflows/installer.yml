@@ -1,0 +1,128 @@
+name: installer
+
+on:
+  push:
+    paths: ['install/**', '.github/workflows/installer.yml']
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: powershell   # Windows PowerShell 5.1, what players have
+    env:
+      URL: https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/install/install.ps1
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install, repair, check and uninstall through irm
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSVersionTable.PSVersion.ToString()
+          function Fail($m) { Write-Host "FAIL: $m" -ForegroundColor Red; exit 1 }
+          function Make($d) {
+            Remove-Item -Recurse -Force $d -ErrorAction SilentlyContinue
+            New-Item -ItemType Directory "$d\Data", "$d\mods" | Out-Null
+            foreach ($f in 'WoW.exe', 'VanillaFixes.exe', 'VfPatcher.dll') { New-Item -ItemType File "$d\$f" | Out-Null }
+            [IO.File]::WriteAllText("$d\realmlist.wtf", "set realmlist play.octowow.st`r`n")
+          }
+          function Run([hashtable]$a, [string]$src = (Invoke-RestMethod $env:URL)) {
+            $sb = [scriptblock]::Create($src)
+            $o = & $sb @a 6>&1 | Out-String
+            Write-Host $o
+            $o
+          }
+          $env:OCTOLOGIN_LANG = 'tr'
+
+          # 1. irm | iex from inside the game folder, Turkish text decoded correctly
+          $g = 'C:\Games\OctoWoW'
+          Make $g
+          [IO.File]::WriteAllText("$g\dlls.txt", "mods/nampower.dll`r`nmods/UnitXP_SP3.dll`r`n")
+          Set-Location $g
+          $o = Invoke-RestMethod $env:URL | Invoke-Expression 6>&1 | Out-String
+          Write-Host $o
+          if ($o -notmatch 'Kuruldu \(v') { Fail 'not installed' }
+          # Expected text built from code points: this test file itself is read as ANSI by PowerShell 5.1.
+          $fixed = "dlls.txt d$([char]0xFC)zeltildi: sat$([char]0x131)r eklendi"
+          if (-not $o.Contains($fixed)) { Fail 'Turkish text broken or dlls.txt not fixed' }
+          if ($ErrorActionPreference -ne 'Stop' -or (Get-Variable -Name ctx -ErrorAction SilentlyContinue)) { Fail 'state leaked into the session' }
+          $t = [IO.File]::ReadAllText("$g\dlls.txt")
+          if ($t -ne "mods/nampower.dll`r`nmods/UnitXP_SP3.dll`r`nmods/OctoLogin.dll`r`n") { Fail "dlls.txt: $t" }
+          $sha = (Get-FileHash "$g\mods\OctoLogin.dll").Hash
+          $want = ((Invoke-RestMethod https://api.github.com/repos/${{ github.repository }}/releases/latest).assets | Where-Object name -eq 'OctoLogin.dll').digest
+          if ("sha256:$($sha.ToLower())" -ne $want) { Fail "hash $sha vs $want" }
+
+          # 2. found by searching from elsewhere; shortcut and compatibility mode warnings
+          Set-Location $env:TEMP
+          $env:OCTOLOGIN_LANG = 'en'
+          $sh = New-Object -ComObject WScript.Shell
+          $l = $sh.CreateShortcut("$([Environment]::GetFolderPath('Desktop'))\WoW.lnk"); $l.TargetPath = "$g\WoW.exe"; $l.Save()
+          New-Item -Force 'HKCU:\Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers' | Out-Null
+          Set-ItemProperty 'HKCU:\Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers' -Name "$g\WoW.exe" -Value '~ WINXPSP3'
+          $o = Run @{ Check = $true }
+          if ($o -notmatch ('\[ OK \]\s+' + [regex]::Escape($g))) { Fail 'search did not find the game' }
+          if ($o -notmatch 'Installed and up to date') { Fail 'not up to date' }
+          if ($o -notmatch 'shortcut starts WoW.exe directly') { Fail 'no shortcut warning' }
+          if ($o -notmatch 'compatibility mode') { Fail 'no compatibility warning' }
+
+          # 3. broken dlls.txt (UTF-16) and wrong lines get repaired
+          [IO.File]::WriteAllText("$g\dlls.txt", "mods/a.dll`r`nOctoLogin.dll`r`nmods\OctoLogin.dll`r`n", [Text.Encoding]::Unicode)
+          $o = Run @{ Check = $true; Game = $g }
+          if ($o -notmatch 'UTF-16') { Fail 'UTF-16 not reported' }
+          $o = Run @{ Game = $g }
+          $t = [IO.File]::ReadAllText("$g\dlls.txt")
+          if ($t -ne "mods/a.dll`r`nmods/OctoLogin.dll`r`n") { Fail "repaired dlls.txt: $t" }
+          if ([IO.File]::ReadAllBytes("$g\dlls.txt")[0] -ne 0x6D) { Fail 'BOM written' }
+
+          # 4. a log from a real run
+          Set-Content "$g\mods\OctoLogin.log" "21:07:47 OctoLogin 1.1.0: ready`r`n21:07:48 login: 185.246.188.177:3724 answered first in 198 ms (realmlist, 3 tried)`r`n21:07:54 world N'Zoth: using 92.114.107.62:8091 (202 ms, 1/1 answered)"
+          $o = Run @{ Check = $true; Game = $g }
+          if ($o -notmatch 'Loaded in the game: OctoLogin 1.1.0' -or $o -notmatch "world N'Zoth") { Fail 'log not read' }
+
+          # 5. GitHub API out of reach (60 requests an hour per IP): still verified against the release page
+          Remove-Item "$g\mods\OctoLogin.dll"
+          $o = Run @{ Game = $g } ((Invoke-RestMethod $env:URL).Replace('https://api.github.com/', 'https://api.github.com/nope/'))
+          if ($o -notmatch 'Installed \(v' -or $o -notmatch 'SHA-256 [0-9a-f]{64}' -or $o -match 'Could not reach GitHub') { Fail 'release page fallback' }
+
+          # 6. uninstall
+          $o = Run @{ Uninstall = $true; Game = $g }
+          if (Test-Path "$g\mods\OctoLogin.dll") { Fail 'dll left behind' }
+          if ([IO.File]::ReadAllText("$g\dlls.txt") -ne "mods/a.dll`r`n") { Fail 'dlls.txt line left behind' }
+          Write-Host 'ALL PASSED' -ForegroundColor Green
+
+      - name: The .bat wrapper
+        shell: cmd
+        run: |
+          set OCTOLOGIN_URL=%URL%
+          set OCTOLOGIN_LANG=en
+          copy install\OctoLogin-Setup.bat C:\Games\OctoWoW\ >nul
+          echo.| C:\Games\OctoWoW\OctoLogin-Setup.bat > out.txt 2>&1
+          type out.txt
+          findstr /C:"Installed (v" out.txt >nul || exit /b 1
+          findstr /C:"line added: mods/OctoLogin.dll" out.txt >nul || exit /b 1
+
+  unix:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      URL: https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/install/install.sh
+    steps:
+      - name: Install, check and uninstall through curl | bash
+        run: |
+          set -eu
+          g="$HOME/Games/OctoWoW"
+          mkdir -p "$g/Data" "$g/mods"; : >"$g/WoW.exe"; : >"$g/VanillaFixes.exe"; : >"$g/VfPatcher.dll"
+          printf 'set realmlist play.octowow.st\r\n' >"$g/realmlist.wtf"
+          printf 'mods/nampower.dll\r\n' >"$g/dlls.txt"
+          cd /tmp
+          out=$(curl -fsSL "$URL" | OCTOLOGIN_LANG=tr bash 2>&1); echo "$out"
+          echo "$out" | grep -q 'Kuruldu (v'
+          echo "$out" | grep -q 'dlls.txt düzeltildi: satır eklendi'
+          [ "$(cat "$g/dlls.txt")" = "$(printf 'mods/nampower.dll\r\nmods/OctoLogin.dll\r')" ]
+          out=$(curl -fsSL "$URL" | bash -s -- --check "$g" 2>&1); echo "$out"
+          echo "$out" | grep -q 'up to date'
+          curl -fsSL "$URL" | bash -s -- --uninstall "$g"
+          [ ! -e "$g/mods/OctoLogin.dll" ]
+          echo ALL PASSED

@@ -56,6 +56,44 @@ connects while you log in, never during play:
 
 ## Install
 
+The setup script finds your game folder, installs the latest release, adds it to `dlls.txt`
+and checks everything OctoLogin needs. Run it again any time: it only fixes what is wrong.
+
+**Windows:** open PowerShell (Start menu, type `powershell`) and paste:
+
+```powershell
+irm https://raw.githubusercontent.com/fmustafayaman/OctoLogin/main/install/install.ps1 | iex
+```
+
+Or download [`OctoLogin-Setup.bat`](install/OctoLogin-Setup.bat) and double-click it.
+
+**Linux and macOS** (Wine, Lutris, Steam/Proton, CrossOver):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/fmustafayaman/OctoLogin/main/install/install.sh | bash
+```
+
+Then start the game with `VanillaFixes.exe` (or the OctoWoW launcher). The first time,
+VanillaFixes asks whether to load the DLLs in `dlls.txt`: press OK.
+
+**Is it working?** After logging in once, run the check. It changes nothing and tells you what
+is wrong: OctoLogin missing or old, a broken `dlls.txt`, VanillaFixes missing, the game started
+without VanillaFixes, a realmlist that points to octoproxy, and what OctoLogin did at your last
+login.
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/fmustafayaman/OctoLogin/main/install/install.ps1))) -Check
+```
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/fmustafayaman/OctoLogin/main/install/install.sh | bash -s -- --check
+```
+
+`-Uninstall` / `--uninstall` removes OctoLogin. If the game folder is not found, pass it:
+`-Game "D:\Games\OctoWoW"` / `bash -s -- "/path/to/OctoWoW"`.
+
+### By hand
+
 1. Download `OctoLogin.dll` from the [releases](../../releases) page.
 2. Copy it into your game's `mods` folder.
 3. Add this line to the end of `dlls.txt` in your game folder:
